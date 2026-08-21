@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -111,6 +111,73 @@ def extract_system_prompt(system: Any) -> str:
         return "\n".join(text_parts)
 
     return str(system)
+
+
+def split_inline_system_messages(
+    messages: List[AnthropicMessage],
+) -> Tuple[str, List[AnthropicMessage]]:
+    """
+    Splits inline system-role messages out of the conversation.
+
+    The official Anthropic API keeps the system prompt in a separate top-level
+    ``system`` field and rejects ``role="system"`` inside ``messages``. Some
+    clients (e.g. Claude Code) nevertheless inject extra instructions as
+    system-role messages in the middle of the conversation. Rejecting them with
+    a 422 breaks those clients, so the gateway hoists their text into the system
+    prompt - the same behavior the OpenAI adapter already applies to
+    ``role="system"`` messages.
+
+    Empty system messages are dropped: they carry no instructions and would only
+    add blank lines to the system prompt. Whitespace-only content counts as empty.
+
+    Args:
+        messages: List of Anthropic messages, possibly containing system-role entries.
+            Accepts both Pydantic models and raw dicts.
+
+    Returns:
+        Tuple of (inline_system_prompt, conversation_messages):
+        - inline_system_prompt: text of all system-role messages joined by newlines,
+          in their original order ("" if there were none)
+        - conversation_messages: original list with system-role messages removed
+
+    Examples:
+        >>> msgs = [{"role": "user", "content": "hi"},
+        ...         {"role": "system", "content": "be brief"}]
+        >>> text, rest = split_inline_system_messages(msgs)
+        >>> text
+        'be brief'
+        >>> [m["role"] for m in rest]
+        ['user']
+    """
+    inline_parts: List[str] = []
+    conversation: List[AnthropicMessage] = []
+
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        else:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", None)
+
+        if role != "system":
+            conversation.append(msg)
+            continue
+
+        text = convert_anthropic_content_to_text(content)
+        if text.strip():
+            inline_parts.append(text)
+        else:
+            logger.debug("Dropping empty inline system message")
+
+    if inline_parts:
+        logger.info(
+            f"Hoisted {len(inline_parts)} inline system message(s) into system prompt "
+            f"({sum(len(part) for part in inline_parts)} chars). "
+            f"Client sent role='system' inside messages, which the Anthropic API forbids."
+        )
+
+    return "\n".join(inline_parts), conversation
 
 
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
@@ -450,15 +517,32 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
+    # Some clients (e.g. Claude Code) send extra instructions as system-role
+    # messages inside `messages`, which the official Anthropic API forbids.
+    # Hoist them into the system prompt instead of rejecting the request.
+    inline_system_prompt, conversation_messages = split_inline_system_messages(request.messages)
+
+    if not conversation_messages:
+        raise ValueError(
+            "Request contains only system messages. "
+            "Add at least one user message to the 'messages' array."
+        )
+
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    unified_messages = convert_anthropic_messages(conversation_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
-    system_prompt = extract_system_prompt(request.system)
+    # Inline system messages (if any) are appended after it, preserving order.
+    system_parts = [
+        part
+        for part in (extract_system_prompt(request.system), inline_system_prompt)
+        if part
+    ]
+    system_prompt = "\n".join(system_parts)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

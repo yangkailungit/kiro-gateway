@@ -389,6 +389,83 @@ class TestContentBlockUnion:
 
 
 # ==================================================================================================
+# Tests for AnthropicMessage role validation (inline system message compatibility)
+# ==================================================================================================
+
+class TestAnthropicMessageRoles:
+    """
+    Tests for the role field of AnthropicMessage.
+
+    The official Anthropic API allows only "user" and "assistant". "system" is
+    additionally accepted for client compatibility: Claude Code injects extra
+    instructions as system-role messages inside `messages`, which previously
+    failed with a 422 validation error.
+    """
+
+    @pytest.mark.parametrize("role", ["user", "assistant", "system"])
+    def test_accepts_supported_roles(self, role):
+        """
+        What it does: Verifies user, assistant and system roles all validate.
+        Purpose: Ensure inline system messages no longer trigger a 422 error.
+        """
+        print(f"Setup: Creating AnthropicMessage with role='{role}'...")
+        message = AnthropicMessage(role=role, content="text")
+
+        print(f"Comparing role: Expected '{role}', Got '{message.role}'")
+        assert message.role == role
+
+    @pytest.mark.parametrize("role", ["tool", "developer", "User", "SYSTEM", ""])
+    def test_rejects_unsupported_roles(self, role):
+        """
+        What it does: Verifies unknown roles are still rejected.
+        Purpose: Ensure the compatibility shim did not turn role into a free-form field.
+        """
+        print(f"Setup: Creating AnthropicMessage with invalid role='{role}'...")
+
+        print("Action: Expecting ValidationError...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicMessage(role=role, content="text")
+
+        print(f"Result: {exc_info.value.errors()[0]['type']}")
+        assert exc_info.value.errors()[0]["loc"] == ("role",)
+
+    def test_system_role_with_content_blocks(self):
+        """
+        What it does: Verifies a system-role message accepts block-form content.
+        Purpose: Ensure clients sending cached/structured system text validate.
+        """
+        print("Setup: System message with text content blocks...")
+        message = AnthropicMessage(
+            role="system",
+            content=[TextContentBlock(text="Be brief")],
+        )
+
+        print(f"Result: role={message.role}, blocks={len(message.content)}")
+        assert message.role == "system"
+        assert message.content[0].text == "Be brief"
+
+    def test_request_with_inline_system_message_validates(self):
+        """
+        What it does: Verifies a full request with an inline system message validates.
+        Purpose: Reproduce the exact Claude Code payload that returned a 422 error.
+        """
+        print("Setup: Request with [user, system] messages...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system="Top-level system prompt",
+            messages=[
+                {"role": "user", "content": "List the files"},
+                {"role": "system", "content": "Available agent types: claude"},
+            ],
+        )
+
+        print(f"Result: roles={[m.role for m in request.messages]}")
+        assert [m.role for m in request.messages] == ["user", "system"]
+        assert request.system == "Top-level system prompt"
+
+
+# ==================================================================================================
 # Tests for AnthropicMessage with Image Content (Issue #30 fix verification)
 # ==================================================================================================
 

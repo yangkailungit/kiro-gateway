@@ -182,12 +182,19 @@ class AnthropicMessage(BaseModel):
     """
     Message in Anthropic format.
 
+    The official Anthropic API allows only "user" and "assistant" here, keeping the
+    system prompt in the separate top-level `system` field. "system" is accepted as
+    well for client compatibility: some clients (e.g. Claude Code) inject extra
+    instructions as system-role messages inside `messages`. Such messages are
+    hoisted into the system prompt by split_inline_system_messages() instead of
+    being rejected with a 422.
+
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role (user, assistant, or system)
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
