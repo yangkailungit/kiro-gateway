@@ -40,7 +40,9 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_mcp_headers
 
 # Import debug_logger
 try:
@@ -74,6 +76,39 @@ def generate_random_id(length: int) -> str:
 # MCP API Functions
 # ==================================================================================================
 
+def _read_error_body(response, max_length: int = 2000) -> str:
+    """
+    Safely extract the body of a failed MCP response for logging.
+
+    A non-200 from /mcp is undiagnosable from the status code alone, so the body
+    must be surfaced. Reading it must never mask the original error, hence the
+    broad guard and the coercion to str.
+
+    Args:
+        response: httpx.Response for a failed request
+        max_length: Maximum characters to keep before truncating
+
+    Returns:
+        Body text, a truncation-annotated prefix, or a placeholder describing
+        why the body was unavailable
+    """
+    try:
+        body = response.text
+        if not isinstance(body, str):
+            body = str(body)
+    except Exception as e:
+        return f"<unreadable response body: {e}>"
+
+    body = body.strip()
+    if not body:
+        return "<empty response body>"
+
+    if len(body) > max_length:
+        return f"{body[:max_length]}... [truncated, {len(body)} chars total]"
+
+    return body
+
+
 async def call_kiro_mcp_api(
     query: str,
     auth_manager
@@ -82,8 +117,13 @@ async def call_kiro_mcp_api(
     Call Kiro MCP API for web_search.
     
     URL: {auth_manager.q_host}/mcp
-    Headers: Authorization, x-amzn-codewhisperer-optout, Content-Type
+    Headers: see get_kiro_mcp_headers() — full Kiro client identification set,
+             minus the AWS event-stream headers that do not apply to JSON-RPC
     Timeout: 60 seconds
+
+    On a non-200 the upstream body is logged (and written to debug_logs when
+    DEBUG_MODE is enabled), because the status code alone does not reveal
+    whether the payload, the headers, or the auth was rejected.
     
     Args:
         query: Search query
@@ -100,8 +140,16 @@ async def call_kiro_mcp_api(
             "params": {
                 "name": "web_search",
                 "arguments": {"query": "..."}
-            }
+            },
+            "profileArn": "arn:aws:codewhisperer:..."
         }
+
+    profileArn is mandatory: runtime.kiro.dev rejects the call with HTTP 400
+    '{"message":"profileArn is required for this request."}' when it is absent.
+    It is placed at the top level, as a sibling of the JSON-RPC members, to match
+    how the same host consumes it in the generateAssistantResponse payload
+    (see converters_core.build_kiro_payload). Not gated on auth_type — the
+    runtime endpoint requires it for all auth types, same as the route handlers.
     
     MCP Response Format:
         {
@@ -135,6 +183,21 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # profileArn is mandatory for runtime.kiro.dev (HTTP 400 without it).
+    # Same resolution order as the route handlers: per-account ARN first, then
+    # the global config fallback. Not gated on auth_type.
+    profile_arn = auth_manager.profile_arn or PROFILE_ARN
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+    else:
+        # Send without it rather than failing locally — let the server decide,
+        # but make the likely cause of the upcoming 400 obvious in the logs.
+        logger.warning(
+            "No profileArn available for MCP web_search request "
+            "(neither account credentials nor PROFILE_ARN config). "
+            "runtime.kiro.dev is expected to reject this with HTTP 400."
+        )
     
     # Log MCP request
     try:
@@ -146,22 +209,32 @@ async def call_kiro_mcp_api(
     
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
-        
+
+        # Full Kiro client headers. The MCP endpoint speaks JSON-RPC over plain
+        # JSON, so it needs its own header set (no x-amz-target / event-stream).
+        headers = get_kiro_mcp_headers(auth_manager, token)
+
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
-        
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
-            
+
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Log the upstream body — without it a 4xx from /mcp is
+                # undiagnosable, since the status code alone does not say
+                # whether the payload, the headers, or the auth was rejected.
+                error_body = _read_error_body(response)
+                logger.error(
+                    f"MCP API error: HTTP {response.status_code} from {mcp_url} - {error_body}"
+                )
+                if debug_logger:
+                    try:
+                        debug_logger.log_raw_chunk(
+                            f"[MCP ERROR] HTTP {response.status_code}\n{error_body}".encode('utf-8')
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log MCP error body: {e}")
                 return None, None
             
             mcp_response = response.json()

@@ -89,6 +89,50 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     }
 
 
+def get_kiro_mcp_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+    """
+    Builds headers for Kiro MCP API requests (JSON-RPC over HTTP).
+
+    Differs from get_kiro_headers(): the MCP endpoint speaks JSON-RPC 2.0 over
+    plain JSON and has no x-amz-target, so the AWS event-stream headers must not
+    be sent.
+
+    The client identification headers (User-Agent, x-amz-user-agent, amz-sdk-*)
+    mirror what every other Kiro call sends; the MCP call previously omitted
+    them. Whether their absence is what the endpoint rejects is NOT confirmed —
+    see call_kiro_mcp_api(), which now logs the upstream error body so the real
+    cause can be identified from a failing request.
+
+    Accept is intentionally JSON-only rather than the JSON + text/event-stream
+    pair the MCP Streamable HTTP spec suggests, because the caller parses the
+    reply with response.json() and cannot decode an SSE-framed body.
+
+    Args:
+        auth_manager: Authentication manager for obtaining fingerprint
+        token: Access token for authorization
+
+    Returns:
+        Dictionary with headers for the MCP HTTP request
+    """
+    fingerprint = auth_manager.fingerprint
+
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        # Deliberately JSON-only: call_kiro_mcp_api parses the response with
+        # response.json(). Advertising text/event-stream would allow the server
+        # to reply with an SSE-framed body we cannot parse.
+        "Accept": "application/json",
+        "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
+        "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
+        # Kept as "false" to preserve the existing MCP opt-out semantics
+        # (differs from get_kiro_headers, which sends "true").
+        "x-amzn-codewhisperer-optout": "false",
+        "amz-sdk-invocation-id": str(uuid.uuid4()),
+        "amz-sdk-request": "attempt=1; max=3",
+    }
+
+
 def generate_completion_id() -> str:
     """
     Generates a unique ID for chat completion.

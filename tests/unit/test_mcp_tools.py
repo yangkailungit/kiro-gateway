@@ -20,12 +20,14 @@ from datetime import datetime
 from kiro.mcp_tools import (
     generate_random_id,
     call_kiro_mcp_api,
+    _read_error_body,
     generate_search_summary,
     extract_query_from_messages,
     handle_native_web_search,
     generate_anthropic_web_search_sse,
     generate_openai_web_search_sse
 )
+from kiro.utils import get_kiro_mcp_headers
 
 
 # ==================================================================================================
@@ -597,6 +599,417 @@ class TestOpenAISSEEmulation:
         
         print("Checking for data: prefix...")
         assert any(chunk.startswith("data:") for chunk in chunks)
-        
+
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+# ==================================================================================================
+# Tests for MCP Error Body Extraction
+# ==================================================================================================
+
+class TestReadErrorBody:
+    """Tests for _read_error_body (diagnostics for failed MCP calls)."""
+
+    def test_returns_body_text(self):
+        """
+        What it does: Verifies a normal error body is returned verbatim.
+        Purpose: A 4xx from /mcp is undiagnosable without the body, so it must survive intact.
+        """
+        print("Setup: Mocking response with a JSON-RPC error body...")
+        response = Mock()
+        response.text = '{"message":"Improperly formed request"}'
+
+        print("Action: Calling _read_error_body...")
+        result = _read_error_body(response)
+
+        print(f"Comparing result: Expected body verbatim, Got {result}")
+        assert result == '{"message":"Improperly formed request"}'
+
+    def test_empty_body_returns_placeholder(self):
+        """
+        What it does: Verifies an empty body yields an explicit placeholder.
+        Purpose: Distinguish "server said nothing" from "we failed to read it".
+        """
+        print("Setup: Mocking response with whitespace-only body...")
+        response = Mock()
+        response.text = "   \n  "
+
+        print("Action: Calling _read_error_body...")
+        result = _read_error_body(response)
+
+        print(f"Comparing result: Expected '<empty response body>', Got {result}")
+        assert result == "<empty response body>"
+
+    def test_long_body_is_truncated_with_total_length(self):
+        """
+        What it does: Verifies oversized bodies are truncated and annotated.
+        Purpose: Prevent a huge HTML error page from flooding the logs.
+        """
+        print("Setup: Mocking response with 3000-char body...")
+        response = Mock()
+        response.text = "x" * 3000
+
+        print("Action: Calling _read_error_body...")
+        result = _read_error_body(response)
+
+        print(f"Comparing result: Expected truncation marker, Got tail {result[-40:]}")
+        assert result.startswith("x" * 2000)
+        assert "truncated, 3000 chars total" in result
+        assert len(result) < 3000
+
+    def test_custom_max_length_is_respected(self):
+        """
+        What it does: Verifies the max_length parameter controls the cutoff.
+        Purpose: Ensure the limit is a real parameter, not a hardcoded constant.
+        """
+        print("Setup: Mocking response with 100-char body, max_length=10...")
+        response = Mock()
+        response.text = "y" * 100
+
+        print("Action: Calling _read_error_body with max_length=10...")
+        result = _read_error_body(response, max_length=10)
+
+        print(f"Comparing result: Expected 10-char prefix, Got {result}")
+        assert result.startswith("y" * 10)
+        assert "truncated, 100 chars total" in result
+
+    def test_unreadable_body_does_not_raise(self):
+        """
+        What it does: Verifies an exception while reading .text is swallowed.
+        Purpose: Diagnostics must never mask the original upstream failure.
+        """
+        print("Setup: Mocking response whose .text raises...")
+
+        class ExplodingResponse:
+            @property
+            def text(self):
+                raise RuntimeError("connection dropped")
+
+        print("Action: Calling _read_error_body...")
+        result = _read_error_body(ExplodingResponse())
+
+        print(f"Comparing result: Expected unreadable placeholder, Got {result}")
+        assert "unreadable response body" in result
+        assert "connection dropped" in result
+
+    def test_non_string_body_is_coerced(self):
+        """
+        What it does: Verifies a non-str .text is coerced instead of crashing.
+        Purpose: Bare Mock responses (and odd clients) expose a non-str .text.
+        """
+        print("Setup: Mocking response with integer .text...")
+        response = Mock()
+        response.text = 12345
+
+        print("Action: Calling _read_error_body...")
+        result = _read_error_body(response)
+
+        print(f"Comparing result: Expected '12345', Got {result}")
+        assert result == "12345"
+
+
+# ==================================================================================================
+# Tests for MCP Headers
+# ==================================================================================================
+
+class TestKiroMCPHeaders:
+    """Tests for get_kiro_mcp_headers (JSON-RPC header contract)."""
+
+    def test_does_not_send_event_stream_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies AWS event-stream headers are absent.
+        Purpose: /mcp speaks JSON-RPC; x-amz-target and x-amz-json-1.0 are wrong here.
+        """
+        print("Setup: Building MCP headers...")
+        headers = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+
+        print(f"Comparing result: Expected no x-amz-target, Got keys {sorted(headers)}")
+        assert "x-amz-target" not in headers
+        assert headers["Content-Type"] == "application/json"
+
+    def test_accept_is_json_only(self, mock_auth_manager):
+        """
+        What it does: Verifies Accept advertises JSON only, not text/event-stream.
+        Purpose: call_kiro_mcp_api parses with response.json(); allowing an SSE-framed
+                 reply would produce a body the caller cannot decode.
+        """
+        print("Setup: Building MCP headers...")
+        headers = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+
+        print(f"Comparing result: Got Accept={headers['Accept']}")
+        assert headers["Accept"] == "application/json"
+        assert "text/event-stream" not in headers["Accept"]
+
+    def test_includes_authorization_and_client_identity(self, mock_auth_manager):
+        """
+        What it does: Verifies auth plus Kiro client identification headers are present.
+        Purpose: The MCP call previously sent only 3 headers, unlike every other Kiro call.
+        """
+        print("Setup: Building MCP headers...")
+        headers = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+
+        print("Comparing result: Expected Bearer token and fingerprinted User-Agent")
+        assert headers["Authorization"] == "Bearer test_token"
+        assert mock_auth_manager.fingerprint in headers["User-Agent"]
+        assert mock_auth_manager.fingerprint in headers["x-amz-user-agent"]
+        assert headers["amz-sdk-request"] == "attempt=1; max=3"
+
+    def test_preserves_existing_optout_semantics(self, mock_auth_manager):
+        """
+        What it does: Verifies optout stays "false" for MCP.
+        Purpose: MCP intentionally differs from get_kiro_headers, which sends "true".
+        """
+        print("Setup: Building MCP headers...")
+        headers = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+
+        print(f"Comparing result: Expected 'false', Got {headers['x-amzn-codewhisperer-optout']}")
+        assert headers["x-amzn-codewhisperer-optout"] == "false"
+
+    def test_invocation_id_is_unique_per_call(self, mock_auth_manager):
+        """
+        What it does: Verifies amz-sdk-invocation-id differs between calls.
+        Purpose: A reused invocation id would make retries look like duplicates upstream.
+        """
+        print("Setup: Building MCP headers twice...")
+        first = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+        second = get_kiro_mcp_headers(mock_auth_manager, "test_token")
+
+        print("Comparing result: Expected differing invocation ids")
+        assert first["amz-sdk-invocation-id"] != second["amz-sdk-invocation-id"]
+
+
+class TestMCPAPIErrorDiagnostics:
+    """Tests that failed MCP calls are diagnosable and use the right headers."""
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_logged(self, mock_auth_manager):
+        """
+        What it does: Verifies the upstream error body reaches the log on non-200.
+        Purpose: The original bug was undiagnosable because the body was discarded.
+        """
+        print("Setup: Mocking HTTP 400 with a descriptive body...")
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = '{"message":"Improperly formed request"}'
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with logger captured...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.logger") as mock_logger:
+                tool_use_id, results = await call_kiro_mcp_api("test", mock_auth_manager)
+
+        logged = " ".join(str(c) for c in mock_logger.error.call_args_list)
+        print(f"Comparing result: Expected body in log, Got {logged[:160]}")
+        assert tool_use_id is None
+        assert results is None
+        assert "Improperly formed request" in logged
+        assert "400" in logged
+
+    @pytest.mark.asyncio
+    async def test_call_sends_mcp_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies call_kiro_mcp_api actually sends the MCP header set.
+        Purpose: Wiring get_kiro_mcp_headers into the call IS the fix; assert it is used.
+        """
+        print("Setup: Mocking HTTP 400 to capture the outgoing request...")
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = "denied"
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test query", mock_auth_manager)
+
+        sent_headers = mock_post.call_args.kwargs["headers"]
+        sent_payload = mock_post.call_args.kwargs["json"]
+
+        print(f"Comparing result: Got header keys {sorted(sent_headers)}")
+        assert "x-amz-target" not in sent_headers
+        assert sent_headers["Content-Type"] == "application/json"
+        assert sent_headers["Accept"] == "application/json"
+        assert mock_auth_manager.fingerprint in sent_headers["User-Agent"]
+
+        print("Checking JSON-RPC envelope is unchanged...")
+        assert sent_payload["jsonrpc"] == "2.0"
+        assert sent_payload["method"] == "tools/call"
+        assert sent_payload["params"]["arguments"]["query"] == "test query"
+
+
+class TestMCPProfileArn:
+    """
+    Tests for profileArn in the MCP request.
+
+    runtime.kiro.dev rejects web_search with HTTP 400
+    '{"message":"profileArn is required for this request."}' when profileArn is
+    absent, which was the actual cause of the Path A failure.
+    """
+
+    @staticmethod
+    def _capture_post():
+        """Build a mock httpx client that captures the outgoing request."""
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = "stop after capture"
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+        return mock_post, mock_client
+
+    @pytest.mark.asyncio
+    async def test_profile_arn_from_auth_manager_is_sent(self, mock_auth_manager):
+        """
+        What it does: Verifies the account's profileArn is included in the request.
+        Purpose: Its absence is what produced the HTTP 400; assert it is now present.
+        """
+        print("Setup: auth_manager with a profile ARN...")
+        mock_post, mock_client = self._capture_post()
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        print(f"Comparing result: Got profileArn={sent_payload.get('profileArn')}")
+        assert sent_payload["profileArn"] == mock_auth_manager.profile_arn
+
+    @pytest.mark.asyncio
+    async def test_profile_arn_is_top_level_sibling_of_jsonrpc_members(self, mock_auth_manager):
+        """
+        What it does: Verifies profileArn sits at the top level, not inside params.
+        Purpose: Mirrors how the same host consumes it in the generateAssistantResponse
+                 payload; pins the placement so a regression is visible.
+        """
+        print("Setup: auth_manager with a profile ARN...")
+        mock_post, mock_client = self._capture_post()
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        print(f"Comparing result: Got top-level keys {sorted(sent_payload)}")
+        assert "profileArn" in sent_payload
+        assert "profileArn" not in sent_payload["params"]
+        assert "profileArn" not in sent_payload["params"]["arguments"]
+
+        print("Checking the JSON-RPC envelope still validates...")
+        assert sent_payload["jsonrpc"] == "2.0"
+        assert sent_payload["method"] == "tools/call"
+        assert sent_payload["params"]["name"] == "web_search"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_config_profile_arn(self, mock_auth_manager):
+        """
+        What it does: Verifies PROFILE_ARN config is used when the account has none.
+        Purpose: Same resolution order as the route handlers, so env-only setups work.
+        """
+        print("Setup: auth_manager without an ARN, PROFILE_ARN config set...")
+        mock_auth_manager._profile_arn = None
+        mock_post, mock_client = self._capture_post()
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:999:profile/env"):
+                await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        print(f"Comparing result: Got profileArn={sent_payload.get('profileArn')}")
+        assert sent_payload["profileArn"] == "arn:aws:codewhisperer:us-east-1:999:profile/env"
+
+    @pytest.mark.asyncio
+    async def test_account_arn_takes_precedence_over_config(self, mock_auth_manager):
+        """
+        What it does: Verifies the account ARN wins over the global config value.
+        Purpose: With multiple accounts, the config fallback must not override the
+                 ARN belonging to the account actually making the call.
+        """
+        print("Setup: both account ARN and PROFILE_ARN config set...")
+        mock_post, mock_client = self._capture_post()
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:999:profile/env"):
+                await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        print(f"Comparing result: Got profileArn={sent_payload.get('profileArn')}")
+        assert sent_payload["profileArn"] == mock_auth_manager.profile_arn
+        assert "999" not in sent_payload["profileArn"]
+
+    @pytest.mark.asyncio
+    async def test_warns_and_omits_key_when_no_arn_available(self, mock_auth_manager):
+        """
+        What it does: Verifies a missing ARN logs a warning and omits the key.
+        Purpose: Sending profileArn=None would be a different, more confusing error;
+                 the warning names the likely cause of the resulting 400.
+        """
+        print("Setup: no account ARN and empty PROFILE_ARN config...")
+        mock_auth_manager._profile_arn = None
+        mock_post, mock_client = self._capture_post()
+
+        print("Action: Calling call_kiro_mcp_api with logger captured...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.PROFILE_ARN", ""):
+                with patch("kiro.mcp_tools.logger") as mock_logger:
+                    await call_kiro_mcp_api("test", mock_auth_manager)
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        warned = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+
+        print(f"Comparing result: Expected key absent, Got keys {sorted(sent_payload)}")
+        assert "profileArn" not in sent_payload
+
+        print(f"Checking warning mentions profileArn, Got {warned[:120]}")
+        assert "profileArn" in warned
+
+    @pytest.mark.asyncio
+    async def test_successful_call_still_parses_results(self, mock_auth_manager):
+        """
+        What it does: Verifies adding profileArn did not break successful parsing.
+        Purpose: The happy path must survive the payload change.
+        """
+        print("Setup: Mocking a successful MCP response...")
+        mock_response_data = {
+            "id": "web_search_tooluse_abc_1_xyz",
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "results": [{"title": "Spring Boot", "url": "https://spring.io", "snippet": "s"}],
+                        "totalResults": 1,
+                        "query": "test"
+                    })
+                }],
+                "isError": False
+            }
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            tool_use_id, results = await call_kiro_mcp_api("test", mock_auth_manager)
+
+        print(f"Comparing result: Got tool_use_id={tool_use_id}, totalResults={results.get('totalResults')}")
+        assert tool_use_id is not None
+        assert tool_use_id.startswith("srvtoolu_")
+        assert results["totalResults"] == 1
+
+        print("Checking profileArn was still sent on the success path...")
+        assert mock_post.call_args.kwargs["json"]["profileArn"] == mock_auth_manager.profile_arn
