@@ -17,6 +17,9 @@ from unittest.mock import patch, MagicMock
 
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
+    get_block_field,
+    format_server_tool_use_block,
+    format_web_search_tool_result_block,
     extract_system_prompt,
     split_inline_system_messages,
     extract_tool_results_from_anthropic_content,
@@ -36,6 +39,9 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     SystemContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
+    WebSearchResultBlock,
 )
 
 
@@ -153,6 +159,333 @@ class TestConvertAnthropicContentToText:
 
         print(f"Comparing result: Expected '42', Got '{result}'")
         assert result == "42"
+
+
+# ==================================================================================================
+# Tests for get_block_field
+# ==================================================================================================
+
+
+class TestGetBlockFieldSuccess:
+    """Tests for get_block_field helper."""
+
+    def test_reads_field_from_dict(self):
+        """
+        What it does: Verifies field lookup on a raw dict block.
+        Purpose: Clients send dicts, so dict access must work.
+        """
+        print("Setup: Dict block...")
+        block = {"type": "text", "text": "Hello"}
+
+        print("Action: Reading 'text'...")
+        result = get_block_field(block, "text")
+
+        print(f"Comparing result: Expected 'Hello', Got '{result}'")
+        assert result == "Hello"
+
+    def test_reads_field_from_pydantic_model(self):
+        """
+        What it does: Verifies field lookup on a Pydantic block.
+        Purpose: The gateway's own models are Pydantic objects.
+        """
+        print("Setup: Pydantic block...")
+        block = TextContentBlock(text="World")
+
+        print("Action: Reading 'text'...")
+        result = get_block_field(block, "text")
+
+        print(f"Comparing result: Expected 'World', Got '{result}'")
+        assert result == "World"
+
+    def test_returns_default_for_missing_field(self):
+        """
+        What it does: Verifies the default is returned when the field is absent.
+        Purpose: Ensure sparse blocks don't raise AttributeError or KeyError.
+        """
+        print("Setup: Dict block without 'url'...")
+        block = {"type": "text"}
+
+        print("Action: Reading 'url' with a default...")
+        result = get_block_field(block, "url", "fallback")
+
+        print(f"Comparing result: Expected 'fallback', Got '{result}'")
+        assert result == "fallback"
+
+
+# ==================================================================================================
+# Tests for server-side tool block formatting
+# ==================================================================================================
+
+
+class TestFormatServerToolUseBlockSuccess:
+    """Tests for format_server_tool_use_block."""
+
+    def test_renders_name_and_query(self):
+        """
+        What it does: Verifies a server_tool_use block renders name and query.
+        Purpose: Kiro has no server-side tools, so the call becomes readable text.
+        """
+        print("Setup: server_tool_use block with a query...")
+        block = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "python asyncio"},
+        }
+
+        print("Action: Formatting...")
+        result = format_server_tool_use_block(block)
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "[Used web_search: python asyncio]"
+
+    def test_renders_pydantic_block(self):
+        """
+        What it does: Verifies formatting works on a Pydantic block.
+        Purpose: Requests parsed into models must render identically to dicts.
+        """
+        print("Setup: Pydantic ServerToolUseContentBlock...")
+        block = ServerToolUseContentBlock(
+            id="srvtoolu_1", name="web_search", input={"query": "kiro gateway"}
+        )
+
+        print("Action: Formatting...")
+        result = format_server_tool_use_block(block)
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "[Used web_search: kiro gateway]"
+
+    def test_omits_query_when_absent(self):
+        """
+        What it does: Verifies rendering without a query field.
+        Purpose: Ensure non-search server tools still render.
+        """
+        print("Setup: server_tool_use block with empty input...")
+        block = {"type": "server_tool_use", "id": "s1", "name": "code_execution", "input": {}}
+
+        print("Action: Formatting...")
+        result = format_server_tool_use_block(block)
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "[Used code_execution]"
+
+
+class TestFormatWebSearchToolResultBlockSuccess:
+    """Tests for format_web_search_tool_result_block."""
+
+    def test_renders_numbered_results(self):
+        """
+        What it does: Verifies results render as a numbered title/URL/excerpt list.
+        Purpose: Preserve the search context the model produced on the prior turn.
+        """
+        print("Setup: web_search_tool_result with two results...")
+        block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "First",
+                    "url": "https://a.example",
+                    "encrypted_content": "Excerpt A",
+                },
+                {
+                    "type": "web_search_result",
+                    "title": "Second",
+                    "url": "https://b.example",
+                    "encrypted_content": "Excerpt B",
+                },
+            ],
+        }
+
+        print("Action: Formatting...")
+        result = format_web_search_tool_result_block(block)
+
+        print(f"Result:\n{result}")
+        assert result == (
+            "[Web search results]\n"
+            "1. First - https://a.example\n"
+            "   Excerpt A\n"
+            "2. Second - https://b.example\n"
+            "   Excerpt B"
+        )
+
+    def test_renders_pydantic_results(self):
+        """
+        What it does: Verifies formatting of Pydantic result blocks.
+        Purpose: Parsed requests must render the same as raw dicts.
+        """
+        print("Setup: Pydantic WebSearchToolResultContentBlock...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_1",
+            content=[
+                WebSearchResultBlock(
+                    title="Docs", url="https://docs.example", encrypted_content="Guide"
+                )
+            ],
+        )
+
+        print("Action: Formatting...")
+        result = format_web_search_tool_result_block(block)
+
+        print(f"Result:\n{result}")
+        assert result == "[Web search results]\n1. Docs - https://docs.example\n   Guide"
+
+
+class TestFormatWebSearchToolResultBlockEdgeCases:
+    """Edge cases for format_web_search_tool_result_block."""
+
+    def test_renders_error_object(self):
+        """
+        What it does: Verifies the error variant renders as a short error line.
+        Purpose: The Anthropic spec allows an error object instead of results.
+        """
+        print("Setup: web_search_tool_result carrying an error...")
+        block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": "s1",
+            "content": {
+                "type": "web_search_tool_result_error",
+                "error_code": "max_uses_exceeded",
+            },
+        }
+
+        print("Action: Formatting...")
+        result = format_web_search_tool_result_block(block)
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "[Web search failed: max_uses_exceeded]"
+
+    def test_returns_empty_for_empty_results(self):
+        """
+        What it does: Verifies an empty result list produces no text.
+        Purpose: Avoid injecting a bare header with nothing under it.
+        """
+        print("Setup: web_search_tool_result with an empty list...")
+        block = {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []}
+
+        print("Action: Formatting...")
+        result = format_web_search_tool_result_block(block)
+
+        print(f"Comparing result: Expected '', Got '{result}'")
+        assert result == ""
+
+    def test_handles_results_with_missing_fields(self):
+        """
+        What it does: Verifies sparse results render without crashing.
+        Purpose: Search backends may omit title, URL, or excerpt.
+        """
+        print("Setup: web_search_tool_result with a bare result...")
+        block = {
+            "type": "web_search_tool_result",
+            "tool_use_id": "s1",
+            "content": [{"type": "web_search_result"}],
+        }
+
+        print("Action: Formatting...")
+        result = format_web_search_tool_result_block(block)
+
+        print(f"Comparing result: Got '{result}'")
+        assert result == "[Web search results]\n1. Untitled"
+
+
+class TestConvertAnthropicContentToTextWithServerTools:
+    """Tests for flattening server-side tool blocks into text (web_search replay)."""
+
+    def test_flattens_web_search_turn_in_order(self):
+        """
+        What it does: Verifies a replayed web_search turn keeps its document order.
+        Purpose: The search must appear before the summary that draws on it.
+
+        Regression test for the 422 on web_search history replay: the blocks now
+        parse, and their content reaches Kiro as text instead of being dropped.
+        """
+        print("Setup: assistant content with search, results, then summary...")
+        content = [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "pip mate"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [
+                    {
+                        "type": "web_search_result",
+                        "title": "PiP Mate",
+                        "url": "https://pip.example",
+                        "encrypted_content": "Speed lock",
+                    }
+                ],
+            },
+            {"type": "text", "text": "That extension solves it."},
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Result:\n{result}")
+        assert "[Used web_search: pip mate]" in result
+        assert "1. PiP Mate - https://pip.example" in result
+        assert "Speed lock" in result
+        assert "That extension solves it." in result
+
+        print("Comparing order: search < results < summary")
+        assert result.index("[Used web_search") < result.index("[Web search results]")
+        assert result.index("[Web search results]") < result.index("That extension solves it.")
+
+    def test_flattens_pydantic_server_tool_blocks(self):
+        """
+        What it does: Verifies flattening works on parsed Pydantic content.
+        Purpose: Real requests arrive as models, not dicts, after validation.
+        """
+        print("Setup: Pydantic server-side blocks plus a text block...")
+        content = [
+            ServerToolUseContentBlock(id="s1", name="web_search", input={"query": "kiro"}),
+            WebSearchToolResultContentBlock(
+                tool_use_id="s1",
+                content=[WebSearchResultBlock(title="Kiro", url="https://kiro.example")],
+            ),
+            TextContentBlock(text="Summary."),
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Result:\n{result}")
+        assert "[Used web_search: kiro]" in result
+        assert "1. Kiro - https://kiro.example" in result
+        assert result.rstrip().endswith("Summary.")
+
+    def test_still_ignores_tool_use_blocks(self):
+        """
+        What it does: Verifies client-side tool_use blocks remain excluded from text.
+        Purpose: Those are converted separately into tool_calls, not text.
+        """
+        print("Setup: content mixing server_tool_use and client tool_use...")
+        content = [
+            {
+                "type": "server_tool_use",
+                "id": "s1",
+                "name": "web_search",
+                "input": {"query": "q"},
+            },
+            {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "text", "text": "Done."},
+        ]
+
+        print("Action: Extracting text...")
+        result = convert_anthropic_content_to_text(content)
+
+        print(f"Result:\n{result}")
+        assert "[Used web_search: q]" in result
+        assert "Done." in result
+
+        print("Comparing: client tool_use must not leak into text")
+        assert "Bash" not in result
+        assert "call_1" not in result
 
 
 # ==================================================================================================

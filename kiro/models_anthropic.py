@@ -162,7 +162,79 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+# ==================================================================================================
+# Server-Side Tool Content Block Models (web_search)
+# ==================================================================================================
+
+
+class WebSearchResultBlock(BaseModel):
+    """
+    Single web search result inside a web_search_tool_result block.
+
+    Attributes:
+        type: Always "web_search_result"
+        title: Page title
+        url: Page URL
+        encrypted_content: Page excerpt. The gateway puts a readable snippet here
+            (see mcp_tools.py); the official Anthropic API returns an opaque blob.
+        page_age: Age of the page as reported by the search backend
+    """
+
+    type: Literal["web_search_result"] = "web_search_result"
+    title: Optional[str] = None
+    url: Optional[str] = None
+    encrypted_content: Optional[str] = None
+    page_age: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool invocation block in Anthropic format.
+
+    Emitted by the gateway itself for web_search (streaming_anthropic.py and
+    mcp_tools.py) and echoed back by clients on the next turn as part of the
+    conversation history. Accepting it here keeps that round-trip working.
+
+    Attributes:
+        type: Always "server_tool_use"
+        id: Tool use ID (referenced by the matching web_search_tool_result)
+        name: Server-side tool name (e.g. "web_search")
+        input: Tool input (e.g. {"query": "..."})
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Result of a server-side web_search invocation.
+
+    The content is normally a list of web_search_result blocks, but the Anthropic
+    spec also allows an error object
+    (``{"type": "web_search_tool_result_error", "error_code": "..."}``), so a raw
+    dict is accepted as well.
+
+    Attributes:
+        type: Always "web_search_tool_result"
+        tool_use_id: ID of the server_tool_use block this answers
+        content: List of search results, or an error object
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[List[WebSearchResultBlock], Dict[str, Any], None] = None
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images, thinking and server-side tools)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +242,8 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 

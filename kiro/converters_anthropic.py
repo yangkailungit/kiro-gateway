@@ -45,6 +45,95 @@ from kiro.converters_core import (
 )
 
 
+def get_block_field(block: Any, name: str, default: Any = None) -> Any:
+    """
+    Reads a field from a content block that may be a dict or a Pydantic model.
+
+    Clients send raw dicts, while the gateway's own models are Pydantic objects,
+    and both shapes reach the converters.
+
+    Args:
+        block: Content block as dict or Pydantic model
+        name: Field name to read
+        default: Value returned when the field is absent
+
+    Returns:
+        Field value, or default if the block has no such field
+    """
+    if isinstance(block, dict):
+        return block.get(name, default)
+    return getattr(block, name, default)
+
+
+def format_server_tool_use_block(block: Any) -> str:
+    """
+    Renders a server_tool_use block as plain text for Kiro.
+
+    Kiro has no notion of Anthropic's server-side tools, so the invocation is
+    flattened into a readable line that preserves what was searched for.
+
+    Args:
+        block: server_tool_use content block (dict or Pydantic model)
+
+    Returns:
+        Text representation, or "" if the block carries nothing useful
+    """
+    name = get_block_field(block, "name") or "server tool"
+    tool_input = get_block_field(block, "input") or {}
+
+    query = tool_input.get("query") if isinstance(tool_input, dict) else None
+    if query:
+        return f"[Used {name}: {query}]"
+
+    return f"[Used {name}]"
+
+
+def format_web_search_tool_result_block(block: Any) -> str:
+    """
+    Renders a web_search_tool_result block as plain text for Kiro.
+
+    Search results are flattened into a numbered list of title/URL/excerpt so the
+    model keeps the context it produced on the previous turn. The Anthropic spec
+    also allows an error object instead of a result list, which is rendered as a
+    short error line.
+
+    Note: the ``encrypted_content`` field holds a readable excerpt here because
+    the gateway fills it that way (see mcp_tools.py). Content coming from the
+    official Anthropic API is an opaque blob and simply renders as such.
+
+    Args:
+        block: web_search_tool_result content block (dict or Pydantic model)
+
+    Returns:
+        Text representation, or "" if there are no results to render
+    """
+    content = get_block_field(block, "content")
+
+    # Error variant: {"type": "web_search_tool_result_error", "error_code": "..."}
+    if isinstance(content, dict):
+        error_code = content.get("error_code") or "unknown"
+        return f"[Web search failed: {error_code}]"
+
+    if not isinstance(content, list) or not content:
+        return ""
+
+    lines = ["[Web search results]"]
+    for index, result in enumerate(content, start=1):
+        title = get_block_field(result, "title") or "Untitled"
+        url = get_block_field(result, "url") or ""
+        excerpt = get_block_field(result, "encrypted_content") or ""
+
+        header = f"{index}. {title}"
+        if url:
+            header = f"{header} - {url}"
+        lines.append(header)
+
+        if excerpt:
+            lines.append(f"   {excerpt}")
+
+    return "\n".join(lines)
+
+
 def convert_anthropic_content_to_text(content: Any) -> str:
     """
     Extracts text content from Anthropic message content.
@@ -52,6 +141,11 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     Anthropic content can be:
     - String: "Hello, world!"
     - List of content blocks: [{"type": "text", "text": "Hello"}]
+
+    Server-side tool blocks (``server_tool_use`` / ``web_search_tool_result``) are
+    flattened into text in place, so a web_search turn replayed by the client
+    keeps its results and stays in its original position relative to the
+    assistant's summary. Kiro does not understand these block types natively.
 
     Args:
         content: Anthropic message content
@@ -65,11 +159,19 @@ def convert_anthropic_content_to_text(content: Any) -> str:
     if isinstance(content, list):
         text_parts = []
         for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
+            block_type = get_block_field(block, "type")
+
+            if block_type == "text":
+                text_parts.append(get_block_field(block, "text", "") or "")
+            elif block_type == "server_tool_use":
+                rendered = format_server_tool_use_block(block)
+                if rendered:
+                    text_parts.append(f"\n{rendered}\n")
+            elif block_type == "web_search_tool_result":
+                rendered = format_web_search_tool_result_block(block)
+                if rendered:
+                    text_parts.append(f"\n{rendered}\n")
+
         return "".join(text_parts)
 
     return str(content) if content else ""

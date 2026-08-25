@@ -22,6 +22,10 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    # Server-side tool content blocks
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
+    WebSearchResultBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -386,6 +390,145 @@ class TestContentBlockUnion:
         print(f"Result: {block}")
         print(f"Comparing type: Expected 'tool_result', Got '{block.type}'")
         assert block.type == "tool_result"
+
+    def test_accepts_server_tool_use_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts ServerToolUseContentBlock.
+        Purpose: Ensure union includes server-side tool invocations.
+
+        The gateway emits server_tool_use blocks itself for web_search, so clients
+        replay them in the conversation history. Before this was in the union,
+        that replay produced a 422.
+        """
+        print("Setup: Creating ServerToolUseContentBlock...")
+        block: ContentBlock = ServerToolUseContentBlock(
+            id="srvtoolu_123",
+            name="web_search",
+            input={"query": "python asyncio"},
+        )
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'server_tool_use', Got '{block.type}'")
+        assert block.type == "server_tool_use"
+        assert block.input["query"] == "python asyncio"
+
+    def test_accepts_web_search_tool_result_content_block(self):
+        """
+        What it does: Verifies ContentBlock accepts WebSearchToolResultContentBlock.
+        Purpose: Ensure union includes server-side web_search results.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock...")
+        block: ContentBlock = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_123",
+            content=[
+                WebSearchResultBlock(
+                    title="Example",
+                    url="https://example.com",
+                    encrypted_content="An excerpt",
+                )
+            ],
+        )
+
+        print(f"Result: {block}")
+        print(f"Comparing type: Expected 'web_search_tool_result', Got '{block.type}'")
+        assert block.type == "web_search_tool_result"
+        assert block.content[0].url == "https://example.com"
+
+
+# ==================================================================================================
+# Tests for server-side tool content blocks (web_search round-trip)
+# ==================================================================================================
+
+
+class TestServerSideToolContentBlocksSuccess:
+    """Tests for server_tool_use and web_search_tool_result blocks."""
+
+    def test_server_tool_use_defaults_empty_input(self):
+        """
+        What it does: Verifies input defaults to an empty dict when omitted.
+        Purpose: Ensure a server_tool_use block without input is still accepted.
+        """
+        print("Setup: Creating server_tool_use without input...")
+        block = ServerToolUseContentBlock(id="srvtoolu_1", name="web_search")
+
+        print(f"Comparing input: Expected {{}}, Got {block.input}")
+        assert block.input == {}
+
+    def test_web_search_result_allows_missing_optional_fields(self):
+        """
+        What it does: Verifies all descriptive fields of a result are optional.
+        Purpose: Ensure sparse results from a search backend are accepted.
+        """
+        print("Setup: Creating web_search_result with no fields...")
+        block = WebSearchResultBlock()
+
+        print(f"Comparing type: Expected 'web_search_result', Got '{block.type}'")
+        assert block.type == "web_search_result"
+        assert block.title is None
+        assert block.page_age is None
+
+    def test_web_search_tool_result_accepts_error_object(self):
+        """
+        What it does: Verifies the error variant of web_search_tool_result.
+        Purpose: The Anthropic spec allows an error object instead of a result list.
+        """
+        print("Setup: Creating web_search_tool_result with an error object...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_1",
+            content={
+                "type": "web_search_tool_result_error",
+                "error_code": "max_uses_exceeded",
+            },
+        )
+
+        print(f"Comparing error_code: Got '{block.content['error_code']}'")
+        assert block.content["error_code"] == "max_uses_exceeded"
+
+    def test_message_with_web_search_history_parses(self):
+        """
+        What it does: Verifies an assistant message replaying a web_search turn parses.
+        Purpose: Regression test for the 422 on web_search history replay.
+
+        This is the exact shape the gateway emits and the client sends back:
+        server_tool_use, then web_search_tool_result, then the text summary.
+        Before server-side blocks joined the ContentBlock union, the whole
+        List[ContentBlock] branch failed and Pydantic reported the misleading
+        "Input should be a valid string" from the discarded `str` branch.
+        """
+        print("Setup: Building assistant message with a full web_search turn...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_f317e15f",
+                    "name": "web_search",
+                    "input": {"query": "chrome picture in picture"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_f317e15f",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "Chrome Web Store",
+                            "url": "https://chromewebstore.google.com/detail/pip",
+                            "encrypted_content": "PiP speed lock",
+                            "page_age": None,
+                        }
+                    ],
+                },
+                {"type": "text", "text": "Here is what I found."},
+            ],
+        )
+
+        print(f"Action: Parsed {len(message.content)} blocks")
+        types = [block.type for block in message.content]
+
+        print(f"Comparing types: Got {types}")
+        assert types == ["server_tool_use", "web_search_tool_result", "text"]
+        assert isinstance(message.content[0], ServerToolUseContentBlock)
+        assert isinstance(message.content[1], WebSearchToolResultContentBlock)
 
 
 # ==================================================================================================
