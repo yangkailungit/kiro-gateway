@@ -82,12 +82,21 @@ from kiro.config import (
 )
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
+from kiro.console_encoding import configure_console_encoding, symbol
 from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
+
+
+# --- Console Encoding ---
+# Must run before the first write to stdout/stderr: legacy Windows code pages
+# (cp936, cp1251, cp932, ...) cannot encode the emoji and box-drawing characters
+# used in the banner and log messages, which would abort startup with
+# UnicodeEncodeError before any diagnostics reach the user.
+configure_console_encoding()
 
 
 # --- Loguru Configuration ---
@@ -694,6 +703,10 @@ def print_startup_banner(host: str, port: int) -> None:
     """
     Print a startup banner with server information.
     
+    Decorative glyphs are resolved through kiro.console_encoding.symbol() so the
+    banner degrades to ASCII instead of crashing on consoles whose encoding
+    cannot represent emoji.
+    
     Args:
         host: Server host address
         port: Server port
@@ -707,23 +720,29 @@ def print_startup_banner(host: str, port: int) -> None:
     DIM = "\033[2m"
     RESET = "\033[0m"
     
+    # Console-safe decorative glyphs
+    LOGO = symbol("ghost")
+    ARROW = symbol("arrow")
+    SPEECH = symbol("speech")
+    SEPARATOR = symbol("hline") * 48
+    
     # Determine display URL
     display_host = "localhost" if host == "0.0.0.0" else host
     url = f"http://{display_host}:{port}"
     
     print()
-    print(f"  {WHITE}{BOLD}👻 {APP_TITLE} v{APP_VERSION}{RESET}")
+    print(f"  {WHITE}{BOLD}{LOGO} {APP_TITLE} v{APP_VERSION}{RESET}")
     print()
     print(f"  {WHITE}Server running at:{RESET}")
-    print(f"  {GREEN}{BOLD}➜  {url}{RESET}")
+    print(f"  {GREEN}{BOLD}{ARROW}  {url}{RESET}")
     print()
     print(f"  {DIM}API Docs:      {url}/docs{RESET}")
     print(f"  {DIM}Health Check:  {url}/health{RESET}")
     print()
-    print(f"  {DIM}{'─' * 48}{RESET}")
-    print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
-    print(f"  {DIM}{'─' * 48}{RESET}")
+    print(f"  {DIM}{SEPARATOR}{RESET}")
+    print(f"  {WHITE}{SPEECH} Found a bug? Need help? Have questions?{RESET}")
+    print(f"  {YELLOW}{ARROW}  https://github.com/jwadow/kiro-gateway/issues{RESET}")
+    print(f"  {DIM}{SEPARATOR}{RESET}")
     print()
 
 

@@ -28,6 +28,7 @@ Modules:
     - models: Pydantic models for OpenAI API
     - auth: Kiro authentication manager
     - cache: Model metadata cache
+    - console_encoding: Console encoding hardening for non-UTF-8 terminals
     - utils: Helper utilities
     - converters: OpenAI <-> Kiro format conversion
     - parsers: AWS SSE stream parsers
@@ -46,6 +47,7 @@ __author__ = "Jwadow"
 # Main components for convenient import
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
+from kiro.console_encoding import configure_console_encoding, symbol, unicode_output_supported
 from kiro.http_client import KiroHttpClient
 from kiro.routes_openai import router
 from kiro.model_resolver import ModelResolver, normalize_model_name, get_model_id_for_kiro
@@ -101,6 +103,11 @@ __all__ = [
     "KiroHttpClient",
     "ModelResolver",
     "router",
+    
+    # Console encoding
+    "configure_console_encoding",
+    "unicode_output_supported",
+    "symbol",
     
     # Configuration
     "PROXY_API_KEY",
